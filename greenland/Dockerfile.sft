@@ -1,0 +1,35 @@
+# =============================================================================
+# Greenland SFT Image
+# =============================================================================
+# 基于 slimerl/slime:latest，添加 ms-swift + liger-kernel 用于 LoRA/Full SFT。
+# torchao 升级到 >=0.16.0 以兼容 ms-swift。
+#
+# Build:
+#   docker build -t k-step-opd-sft:greenland-v1 -f greenland/Dockerfile.sft .
+#
+# Push:
+#   docker tag k-step-opd-sft:greenland-v1 \
+#     654654486179.dkr.ecr.us-east-2.amazonaws.com/k-step-opd-sft:greenland-v1
+#   docker push 654654486179.dkr.ecr.us-east-2.amazonaws.com/k-step-opd-sft:greenland-v1
+# =============================================================================
+
+FROM slimerl/slime:latest
+
+# Upgrade torchao for ms-swift compatibility
+RUN pip install --no-cache-dir 'torchao>=0.16.0'
+
+# Install ms-swift + liger-kernel (pin 4.2.0 for multi-node packing fix)
+RUN pip install --no-cache-dir 'ms-swift[all]==4.2.0' liger-kernel deepspeed
+# Upgrade datasets for Json feature compatibility
+RUN pip install --no-cache-dir --upgrade datasets
+
+# Install AWS CLI + boto3 for S3 access
+RUN which aws || pip install --no-cache-dir awscli
+RUN pip install --no-cache-dir boto3
+
+# Bootstrap script
+COPY greenland/bootstrap_sft.sh /greenland/bootstrap.sh
+RUN chmod +x /greenland/bootstrap.sh
+
+# Default command
+CMD ["bash", "/greenland/bootstrap.sh"]

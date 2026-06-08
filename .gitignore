@@ -1,0 +1,37 @@
+# --- Embedded third-party repos (track upstream separately, not as submodules) ---
+Lightning-OPD/
+sglang/
+slime/
+tinker-cookbook/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.env
+
+# --- Large raw analysis dumps (regenerable) ---
+kl_analysis/dumps_A/
+kl_analysis/dumps_B/
+
+# --- Large local artifacts ---
+logs-insights-results.json
+*.pdf
+*.ckpt
+*.safetensors
+*.bin
+*.pt
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# --- Logs ---
+*.log
+logs/
+wandb/

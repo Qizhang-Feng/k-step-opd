@@ -1,0 +1,59 @@
+{
+  "_comment": "K-Step OPD: SFT 100K checkpoint -> OPD with Qwen3-8B teacher",
+  "JobName": "qzf-opd-100k",
+  "Topology": "Zonal",
+  "InitiativeId": "csai-delphi-model-p5",
+  "InstanceType": "p5.48xlarge",
+  "IsProduction": false,
+  "InstanceCount": 1,
+  "Role": "arn:aws:iam::654654486179:role/IibsAdminAccess-DO-NOT-DELETE",
+  "region": "us-east-2",
+  "EstimatedExecutionDuration": 16,
+  "BatchJobDefinitionParameters": {
+    "nodeProperties": {
+      "numNodes": 1,
+      "mainNode": 0,
+      "nodeRangeProperties": [
+        {
+          "targetNodes": "0:",
+          "container": {
+            "image": "654654486179.dkr.ecr.us-east-2.amazonaws.com/k-step-opd-slime:greenland-v1",
+            "command": ["bash", "-c", "python3 -c \"import boto3; s3=boto3.client('s3',region_name='us-east-2'); s3.download_file('delphi-greenland-res-alpha','qzf/code/bootstrap_slime.sh','/tmp/bootstrap.sh')\" && bash /tmp/bootstrap.sh"],
+            "resourceRequirements": [
+              {"value": "192", "type": "VCPU"},
+              {"value": "2013184", "type": "MEMORY"},
+              {"value": "8", "type": "GPU"}
+            ],
+            "environment": [
+              {"name": "S3_BUCKET", "value": "delphi-greenland-res-alpha"},
+              {"name": "S3_REGION", "value": "us-east-2"},
+              {"name": "S3_STUDENT_KEY", "value": "qzf/checkpoints/sft-100k-torch_dist"},
+              {"name": "S3_STUDENT_HF_KEY", "value": "qzf/checkpoints/sft-100k-merged"},
+              {"name": "S3_TEACHER_KEY", "value": "qzf/models/Qwen3-8B"},
+              {"name": "S3_DATA_KEY", "value": "qzf/data/dapo-math-17k.jsonl"},
+              {"name": "S3_CODE_KEY", "value": "qzf/code/k-step-opd.tar.gz"},
+              {"name": "TRAIN_SCRIPT", "value": "scripts/train-opd.sh"},
+              {"name": "NUM_ROLLOUT", "value": "200"},
+              {"name": "GLOBAL_BATCH_SIZE", "value": "32"},
+              {"name": "OPD_KL_COEF", "value": "1.0"},
+              {"name": "LR", "value": "5e-7"},
+              {"name": "UPLOAD_OUTPUTS", "value": "1"},
+              {"name": "NCCL_IB_DISABLE", "value": "0"},
+              {"name": "HF_HUB_OFFLINE", "value": "1"}
+            ],
+            "volumes": [
+              {"host": {"sourcePath": "/tmp/instance_storage"}, "name": "nvme"}
+            ],
+            "mountPoints": [
+              {"containerPath": "/tmp/instance_storage", "readOnly": false, "sourceVolume": "nvme"}
+            ],
+            "linuxParameters": {
+              "sharedMemorySize": 2013184
+            }
+          }
+        }
+      ]
+    },
+    "tags": {}
+  }
+}

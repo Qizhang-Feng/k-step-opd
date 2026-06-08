@@ -1,0 +1,53 @@
+{
+  "_comment": "K-Step OPD: 4B 152K mixed @ 700 steps (cosine over 700) — same budget as v2 79K × 3ep",
+  "JobName": "k-step-opd-sft-full-4b-152k-700steps",
+  "Topology": "Zonal",
+  "InitiativeId": "csai-delphi-model-p5",
+  "InstanceType": "p5.48xlarge",
+  "IsProduction": false,
+  "InstanceCount": 1,
+  "Role": "arn:aws:iam::654654486179:role/IibsAdminAccess-DO-NOT-DELETE",
+  "region": "us-east-2",
+  "EstimatedExecutionDuration": 12,
+  "BatchJobDefinitionParameters": {
+    "nodeProperties": {
+      "numNodes": 1,
+      "mainNode": 0,
+      "nodeRangeProperties": [
+        {
+          "targetNodes": "0:",
+          "container": {
+            "image": "654654486179.dkr.ecr.us-east-2.amazonaws.com/k-step-opd-sft:greenland-v2",
+            "command": ["bash", "-c", "python3 -c \"import boto3; s3=boto3.client('s3',region_name='us-east-2'); s3.download_file('delphi-greenland-res-alpha','qzf/code/bootstrap_sft.sh','/tmp/bootstrap.sh')\" && bash /tmp/bootstrap.sh"],
+            "resourceRequirements": [
+              {"value": "192", "type": "VCPU"},
+              {"value": "2013184", "type": "MEMORY"},
+              {"value": "8", "type": "GPU"}
+            ],
+            "environment": [
+              {"name": "S3_BUCKET", "value": "delphi-greenland-res-alpha"},
+              {"name": "S3_REGION", "value": "us-east-2"},
+              {"name": "S3_MODEL_KEY", "value": "qzf/models/Qwen3-4B-Base"},
+              {"name": "S3_DATA_KEY", "value": "qzf/data/teacher_sft_179k_thinkfilter.jsonl"},
+              {"name": "S3_CODE_KEY", "value": "qzf/code/k-step-opd.tar.gz"},
+              {"name": "TRAIN_SCRIPT", "value": "scripts/run-sft-full-4b-152k-700steps.sh"},
+              {"name": "UPLOAD_OUTPUTS", "value": "1"},
+              {"name": "NCCL_IB_DISABLE", "value": "0"},
+              {"name": "HF_HUB_OFFLINE", "value": "1"}
+            ],
+            "volumes": [
+              {"host": {"sourcePath": "/tmp/instance_storage"}, "name": "nvme"}
+            ],
+            "mountPoints": [
+              {"containerPath": "/tmp/instance_storage", "readOnly": false, "sourceVolume": "nvme"}
+            ],
+            "linuxParameters": {
+              "sharedMemorySize": 2013184
+            }
+          }
+        }
+      ]
+    },
+    "tags": {}
+  }
+}

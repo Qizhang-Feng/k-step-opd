@@ -1,0 +1,47 @@
+### model
+model_name_or_path: /root/.cache/huggingface/Qwen3-4B-Base
+trust_remote_code: true
+flash_attn: fa2
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 128
+lora_alpha: 128
+lora_dropout: 0.0
+lora_target: all
+additional_target: lm_head
+enable_liger_kernel: true
+packing: true
+
+### dataset
+dataset: sft_math_100k
+template: default
+cutoff_len: 16384
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_persistent_workers: true
+dataloader_pin_memory: true
+dataloader_num_workers: 4
+
+### output
+output_dir: /root/.cache/huggingface/sft-qwen3-4b-lora-llamafactory-stageA
+logging_steps: 1
+save_steps: 100
+save_total_limit: 5
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: true
+report_to: none
+run_name: qwen3-4b-lora-stageA-8k
+
+### train
+per_device_train_batch_size: 8
+gradient_accumulation_steps: 1
+learning_rate: 5.0e-5
+max_steps: 800
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000

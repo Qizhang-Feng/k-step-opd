@@ -1,0 +1,30 @@
+# =============================================================================
+# Greenland Slime OPD Image
+# =============================================================================
+# 基于 slimerl/slime:latest，保持 torchao==0.9.0 兼容 sglang。
+# 用于 slime OPD 训练（Megatron actor + SGLang rollout + teacher）。
+#
+# Build:
+#   docker build -t k-step-opd-slime:greenland-v1 -f greenland/Dockerfile.slime .
+#
+# Push:
+#   docker tag k-step-opd-slime:greenland-v1 \
+#     654654486179.dkr.ecr.us-east-2.amazonaws.com/k-step-opd-slime:greenland-v1
+#   docker push 654654486179.dkr.ecr.us-east-2.amazonaws.com/k-step-opd-slime:greenland-v1
+# =============================================================================
+
+FROM slimerl/slime:latest
+
+# Ensure torchao stays at 0.9.0 (sglang requirement)
+RUN pip install --no-cache-dir torchao==0.9.0
+
+# Install AWS CLI + boto3 for S3 access
+RUN which aws || pip install --no-cache-dir awscli
+RUN pip install --no-cache-dir boto3
+
+# Bootstrap script
+COPY greenland/bootstrap_slime.sh /greenland/bootstrap.sh
+RUN chmod +x /greenland/bootstrap.sh
+
+# Default command
+CMD ["bash", "/greenland/bootstrap.sh"]
