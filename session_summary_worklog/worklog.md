@@ -2690,3 +2690,166 @@ Phase 2.5 主线先收尾（R5 跑完 + eval + 2 seeds R1' 复现）。Phase 3 h
 - 写 hybrid loss.py prototype 在 `slime/.../loss.py` 加 `--opd-future-rb` flag
 - SGLang `top_logprobs_num=20` 的 teacher logp 已在 worklog 5/11 验证
 - 跑通 regression test：`--opd-future-rb=False` 数值等价 R1（必须）
+
+
+---
+
+## 2026-06-11 (Day 42) — R5 eval + IS dormant 诊断 + OPD vs multi-step PPO 本质冲突
+
+### TL;DR
+
+1. **R5 (mean K=8 + soft mask) eval 完成**：iter299 AIME-24 = 55.20%, AIME-25 = 43.33%, pass@any-24 = 80.00%。比 R3b (50.83) 高 +4.4pt，比 R1 (59.17) 低 4pt。
+2. **三个数学等价 run（R1/R3b/R5）实测 8pt spread**：mask 不触发 → 三个 run 应该逐 token advantage 一致，但 eval 落 50.83 / 55.20 / 59.17 三个不同点。这是 single-seed noise / 平台漂移 / 浮点 accumulate 顺序的总和。
+3. **R5 IS 分布精确测量（29 个 dump rollouts，全训练）**：median=1.00, max=**1.80**, p99=1.12, **frac(IS>c=10) = 0.0000%**, **mean(soft_w) = 1.000000**, mean signal_loss = 0。soft mask 在 R5 严格等价 R1。
+4. **OPD 不能用 multi-step PPO 是结构性原因，不是工程偶然**：reward 跟 student weight 耦合，rollout 复用违反 PPO unbiased assumption。
+5. **dualclip-c=10 在 single-step OPD 是 dead code**：c=10 是 FIPO 在 multi-step PPO setting 下的合理阈值。我们 setup 下要触发 mask 必须 c ≈ 1.5，或者改 mask metric。
+6. **R5 KL dump 关键差异**：R5 dump 文件 keys 多了 `rollout_log_probs`（patch_p53_softmask_logging.py 装上了 dump 那一段）。R3b/R3 dump 没存 rollout_log_probs，无法离线算 IS。
+
+---
+
+### 1. R5 完整 eval 结果（n=16）
+
+| iter | AIME-24 avg_p1 | AIME-25 avg_p1 | pass@any-24 | pass@any-25 | avg_len |
+|---:|---:|---:|---:|---:|---:|
+| 99  | 52.71 | 42.50 | 80.00 | 70.00 | 51,006 |
+| 199 | 53.75 | 44.58 | 80.00 | 73.33 | 50,545 |
+| **299** | **55.21** | **43.33** | **80.00** | 66.67 | 51,778 |
+
+eval files in `kl_analysis/phase25/eval/` (待补，p5-3 上 `/workspace/k-step-opd/eval_results_n16/`).
+
+### 2. Phase 2.5 完整 K=8 ranking 更新
+
+| run | dualclip flag | mask 类型 | iter299 AIME-24 | AIME-25 | pass@any-24 |
+|---|---|---|---:|---:|---:|
+| **R1** | 不传 | 无 | **59.17** ⭐ | **48.33** ⭐ | **83.33** |
+| **R3** (sum kl=0.125) | hard c=10 | hard | 57.92 | 45.62 | 80.00 |
+| **R5** | hard c=10 + soft | soft | **55.21** | 43.33 | 80.00 |
+| **R3b** | hard c=10 | hard | 50.83 | 45.00 | 73.33 |
+
+R3 跟 R3b 都 hard mask 但差 7pt。R5 soft mask 居中。**唯一不变量**是 mask 都不触发 → 数学等价。spread 8.34pt 来自 setup 之外的差异。
+
+### 3. R5 IS ratio 完整诊断（29 dump rollouts × ~131K tokens）
+
+| 量 | 全训练 aggregate |
+|---|---:|
+| Median IS ratio | **1.0000** |
+| Mean IS ratio | 1.0000 |
+| p99 IS | 1.12 |
+| p99.9 IS | 1.31 (early) → 1.17 (late) |
+| **Max IS over 整训练** | **1.80** |
+| frac(IS > 1.5) | 0.0000% |
+| frac(IS > 2) | 0.0000% |
+| frac(IS > 5) | 0.0000% |
+| **frac(IS > c=10)** | **0.0000%** |
+| **frac(soft_w < 1)** | **0.0000%** |
+| Mean soft_w | **1.000000** |
+| Worst soft_w_min | 1.0000 |
+| Mean signal_loss = 1−mean(soft_w) | **0.000000** |
+
+→ R5 soft mask 数学上**严格逐 token 等价 R1**。mean(soft_w)=1.000000 不是近似，是真的没有任何 token 被 attenuated。
+
+数据 / 图 / 脚本：
+- `kl_analysis/phase25/r5_is_ratio_summary.json`
+- `kl_analysis/phase25/r5_is_ratio_diagnostic.png`
+- `scripts/analyze_r5_is_ratio.py`
+
+### 4. 数学等价 run 的 8pt spread = single-seed noise
+
+R1 / R3b / R5 在 mask 不触发条件下 advantage 计算逐 token 一致，但 eval：
+- R1 (p5-2, 6/2, unpatched loss.py) → **59.17**
+- R5 (p5-3, 6/9, patched loss.py + soft flag) → **55.21**
+- R3b (p5-3, 6/7, patched loss.py + hard flag) → **50.83**
+
+差异变量：
+- 平台不同（p5-2 vs p5-3）
+- patched vs unpatched loss.py（前者多了 dump 路径、agg/mask 分支节点 → autograd graph 不同 → 浮点 op 顺序漂移）
+- 训练时机不同（容器 / 共享 Ray cluster 状态）
+- seed 不同（R1 是 6/2 启动的 seed，R3b/R5 都是 6/7-9 启动）
+
+任何一个都可能贡献几 pt eval 漂移。8pt spread 在 single-seed eval ±2-3pt noise band 上叠加多个漂移源，**正常**。
+
+**含义**：
+- "R1 +3.34pt over baseline" 这个 finding **不能只靠 single seed claim**
+- 真正的 effect size 可能在 ±4pt 内不可分辨
+- 必须 multi-seed 复现才能写 paper
+
+### 5. OPD ≠ multi-step PPO（理论上不能直接搬）
+
+为什么 slime / TML / MiniLLM 全是 single-step PPO（rollout 1 次 update 1 次），而不是标准 multi-step PPO（rollout 1 次 update 多次）：
+
+**根本原因**：reward 跟 student weight 耦合
+- RLVR (GRPO/DAPO): reward = 0/1 verify(answer)，**不依赖 student weight**。multi-step PPO 修正 IS 后多次 update unbiased。
+- OPD: reverse_kl[t] = log π_S(y_t) − log π_T(y_t)，**显式依赖 student weight**。第 1 次 update 后 student 变了，reverse_kl 也变了 — multi-step PPO 假设 reward fixed 不成立。
+
+**5 个具体冲突**：
+1. **数学不 well-defined**：multi-step IS correction 假设 r 跟 θ 独立。OPD 的 r 就是 θ 的函数。
+2. **Reverse KL mode-seeking 需 fresh rollout**：KL(S || T) 是 expectation under S。多步 update 后 S 变了，旧 sample 不再 from current S。
+3. **Teacher forward 不能省**：OPD 主成本是 teacher logp（teacher 通常比 student 大）。multi-step PPO 设计目标是**省 rollout**，但 OPD 必须每次 update 重算 teacher logp（理由 1） → 不省反增。
+4. **PPO clip 跟 OPD mode-seeking 对冲**：clip 限制 student 在某 token 上的概率剧烈改变；OPD mode-seeking 正是要把概率集中。multi-step 真触发 clip 时压抑 OPD signal。
+5. **工程惯性 follow RLHF**：MiniLLM/slime/VeRL 把 OPD 当 RLVR 换 reward 的特例，复用 PPO trainer 但 single-step。
+
+**理论 workarounds**（没人实操）：
+- Lightning OPD 的 offline teacher logp pre-compute，本质还是 single-step on student weights，每 epoch 重新算 student logp
+- "K-step PPO with reward recompute" 数学上重写 reverse_kl IS correction 复杂度爆炸
+
+→ multi-step OPD 在 paper-grade 实现上是 unsolved territory。
+
+### 6. dualclip-c=10 在 single-step OPD 是 dead code
+
+FIPO (arXiv 2603.19835) 在 Qwen2.5-32B + DAPO 上跑 multi-step PPO，IS ratio 真能跑到 5-50（policy drift 大），c=10 是合理阈值。
+
+我们 single-step setup 下 IS 完全是数值精度残差（fp16 rollout vs bf16 train、flash attn vs SP-attn、dynamic batching shape 差异），**真实 policy drift = 0**：
+- max IS = 1.80（exp(0.59)），对应 logp 差 0.59
+- 这 0.59 是 SGLang vs Megatron 同 weight 不同 backend 的浮点漂移
+- **不是 PPO 真的在 step 之间 drift**
+
+→ dualclip-c=10 永远不触发 → mask 是 dead code。R3 / R3b / R5 都用了这 flag 但实测都不变 advantage。
+
+### 7. 让 mask 真触发的几条路径
+
+1. **降 c**：c=1.3 或 1.5 让数值噪声过阈触发。但这就脱离 FIPO motivation，变成"剔除 fp 漂移大的 token"，paper 故事弱。
+2. **改 mask metric**（OPD-native）：
+   - **reverse_kl 阈值**：剔除单 token \|reverse_kl\| > τ 的 outlier。**直接对 OPD 信号自身的噪声**。
+   - **Teacher confidence**：mask = 1[H(π_T) ≤ τ]。剔除 teacher 自己不自信位置的 noisy reward。Revisiting OPD (2603.25562) 的 Fig.4 发现 teacher 在 student 长 prefix 上越来越不可信，对应这条。
+   - **Token entropy / decision token gating**：剔除高熵 decision token，跟 EOPD (arXiv 2603.07079) 思路对接。
+3. **改成 multi-step PPO**：理论冲突（理由见上），不推荐。
+
+→ **OPD-native mask metric** 是合理的 paper-grade 改进方向。当前 phase 2.5 的 R3/R3b/R5 用 PPO IS 当 metric，是**抄 FIPO 没考虑 setup 差异**的失误。
+
+### 8. 跟 Phase 3 candidate 的关系
+
+Phase 3 (Day 41) Hybrid-K OPD with RB future term 不依赖 mask trigger，跟 IS dormant 这件事正交。但本日发现的 8pt spread 直接 raise 一个**pre-condition**：
+
+**Phase 3 必须 multi-seed**（≥ 2 seeds × 3 variants）。single-seed 的 RB future variance reduction (+1-2pt 预期) 完全在 noise band 内不可见。
+
+加进 Phase 3 风险表：
+- **Risk 0 (新 highest)**: single-seed 8pt spread 表明 4B+8B OPD 的 platform/seed/code-version 漂移就 ±4pt。任何 Phase 3 改进必须 ≥ 2 seeds × 同平台同 code 版本，否则结论不可信。
+
+### 9. R5 的另一个 paper-relevant finding
+
+R5 vs R3b 都 mean K=8 + dualclip flag (mask 不触发)，但 R5 = 55.21 vs R3b = 50.83，**差 +4.4pt**。两者唯一差是 hard 还是 soft mask 写法。code path：
+
+- R3b hard: `keep_mask = (is_ratio <= dualclip_c).to(reverse_kl.dtype); masked_kl = reverse_kl * keep_mask`
+- R5 soft: `soft_weight = clamp(c / clamp(IS,1), 1); masked_kl = reverse_kl * soft_weight`
+
+两个 code path 的输出在 IS<=10 时**逐元素相等**（hard keep_mask=1, soft weight=1）。但 autograd graph：
+- hard: bool cast → no grad
+- soft: clamp + div + clamp → 有 grad（虽然 ratio 是 detached 不会回 student，但 autograd 节点存在）
+
+→ 这两个看起来等价的 code path 通过 autograd graph 浮点积累的差别在 300 rollouts 累成 4pt。这是 **slime 这个 PyTorch + Megatron + SGLang 多组件 stack 在 single-seed 下的真实 sensitivity**。Paper 写不写？写它 = "single-seed OPD eval 不可信"是 negative finding，但 actionable。
+
+### 10. 推荐 next steps（更新后的 priority）
+
+1. **R1 second seed 复现**（最高优先级）：在 p5-3 用 patched loss.py + 不传 dualclip flag 跑 R1' (seed=B)。这是 8pt spread 谜的关键诊断。
+   - 如果 R1' ≈ R1 (59.17) → 8pt spread 来自 mask flag 触发 code path 副作用
+   - 如果 R1' ≈ R5 (55.21) → 8pt spread 来自 platform / code 版本，R1=59.17 是 single-seed luck
+   - 如果 R1' ≈ R3b (50.83) → R3b 也是 luck，所有 spread 都是 noise band 内的 spurious
+2. **写 paper 时把 R1 vs B 的 +3.3pt 改写为 ±4pt CI**（直到 multi-seed 数据补上）
+3. Phase 3 Hybrid-K 暂缓启动，等 R1' 数据出来再决定要不要起
+4. 写 follow-up paper 想法：reverse_kl 阈值 / teacher entropy 当 OPD-native mask metric，跟 Revisiting OPD top-K local support matching 接通
+
+### 11. 文件 / commit
+
+- `scripts/analyze_r5_is_ratio.py` — R5 IS ratio 详细分析（lift 不算这里，全分布算这里）
+- `kl_analysis/phase25/r5_is_ratio_summary.json` / `r5_is_ratio_diagnostic.png`
+- worklog Day 42 entry（本条）
