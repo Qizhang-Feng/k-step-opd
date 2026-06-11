@@ -44,6 +44,7 @@ OPD_GAMMA=${OPD_GAMMA:-1.0}
 OPD_HORIZON=${OPD_HORIZON:--1}
 OPD_AGG=${OPD_AGG:-mean}
 OPD_DUALCLIP_C=${OPD_DUALCLIP_C:--1.0}
+OPD_SOFT_MASK=${OPD_SOFT_MASK:-0}
 OPD_DUMP_KL_PATH=${OPD_DUMP_KL_PATH:-}
 OPD_DUMP_KL_INTERVAL=${OPD_DUMP_KL_INTERVAL:-1}
 OPD_DUMP_KL_MAX_SAMPLES=${OPD_DUMP_KL_MAX_SAMPLES:--1}
@@ -72,6 +73,9 @@ if [ "${OPD_CUMULATIVE}" = "1" ]; then
     # dual-clip mask (FIPO-style): only meaningful in cumulative mode, when c > 0
     if awk "BEGIN{exit !(${OPD_DUALCLIP_C} > 0)}"; then
         OPD_CUMULATIVE_ARGS="$OPD_CUMULATIVE_ARGS --opd-dualclip-c $OPD_DUALCLIP_C"
+        if [ "${OPD_SOFT_MASK}" = "1" ]; then
+            OPD_CUMULATIVE_ARGS="$OPD_CUMULATIVE_ARGS --opd-soft-mask"
+        fi
     fi
 fi
 

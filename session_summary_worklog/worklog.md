@@ -2344,3 +2344,206 @@ long-horizon(我们 4K-30K token reasoning)下，T 很大 → O(T⁴) vs O(T²) 
 - 改动在本地 `slime/slime/backends/megatron_utils/loss.py` + `slime/slime/utils/arguments.py`
 - 部署到机器后需在容器内再跑一次回归 sanity（确认容器 torch 版本下数值一致）
 - 然后可起 R2/R3/R5/R6（sum 半边）：R3 = sum-K8 + dualclip-c10 + kl_coef=0.125（main candidate）
+
+
+---
+
+## 2026-06-09/10 (Day ~40-41) — Phase 2.5 完整 eval + KL dump 系统性诊断
+
+### TL;DR
+
+1. **R1 是 Phase 2.5 winner**：mean K=8 + kl_coef=1.0（无 mask flag）AIME-24 iter299 = **59.17%**（baseline 48.75, opd-4b-B 55.83），AIME-25 = 48.33%。pass@any-24 = 83.33% 比 baseline 76.67% 还高 → **不是 mode collapse**。
+2. **R3 几乎追平 R1**：sum K=8 + mask + kl_coef=0.125 数学上 interior token = R1（mean K=8 ÷K = sum K=8 / 8），eval 也几乎一致（57.92 vs 59.17）。
+3. **R3b/R5/R4 末段 instant_kl ~0.10 不收敛**：mean K=4 (R4) horizon 短，mean K=8+mask flag (R3b/R5) 触发了 dualclip 代码路径副作用（即使 IS ratio < c=10 mask 数学上不触发）。
+4. **训练健康度三个 concern 都有数据支撑**：(a) R1/R3 前 25 步 instant_kl 11x 暴降；(b) R1/R3b/R4 各有一个 grad_norm spike（10-12，是 median 的 ~150x），PPO clip 接住没崩；(c) R1 末段 kl_ref ≈ 0.092 vs B 的 0.07，student 离 SFT init 远。
+5. **KL dump 揭示 reverse_kl 的 token-level temporal structure**：
+   - **Spike clustering 真实存在**（lift(d=1) ≈ 1.5, lift(d=8) ≈ 1.22, lift(d=32) ≈ 1.14）
+   - **Spike amplitude 接近独立**（ρ\|x\| ≈ 0.08）
+   - active token 占 ~32%，spike spacing 中位数 = 2 token
+   - K-window catch rate K=8 → 81%, K=16 → 92%, K=32 → 97%
+6. **K-step OPD 的真实物理基础**：mean-K **同时**做 noise 平均 + 利用 spike clustering 的 reasoning-chunk structure，不是单纯 denoising 也不是简单 future-credit assignment。
+7. **K 没有数据驱动的硬上限**：SNR 单调上升，lift 慢衰减无拐点。K=16/32/full(=4096) 都值得 sweep。
+8. **mode-collapse 警报推翻**：R1/R3 instant_kl ~0.003 不是 mode collapse，是 **deeper convergence**。pass@any、pass@1（greedy）、AIME-25 全部支持。
+
+---
+
+### 1. Phase 2.5 完整 eval (n=16, AIME 24/25)
+
+| run | 末段 instant_kl | iter99 AIME24 | iter199 AIME24 | **iter299 AIME24** | iter299 AIME25 | iter299 pass@any-24 |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline (SFT v2-700) | — | — | — | 48.75 | 40.62 | 76.67 |
+| opd-4b-A (instant) | 0.081 | 50.21 | — | 54.37 | 45.21 | 76.67 |
+| **opd-4b-B (instant)** | 0.093 | 53.54 | — | **55.83** | 45.00 | 80.00 |
+| **R1** (mean K=8, no mask) | **0.003** ⚠️ | 53.12 | 57.50 | **59.17** ⭐ | **48.33** ⭐ | **83.33** ⭐ |
+| **R3** (sum K=8 + mask, kl=0.125) | **0.000** | 50.83 | 57.92 | 57.92 | 45.62 | 80.00 |
+| R3b (mean K=8 + mask, kl=1.0) | 0.100 | 54.58 | 50.62 | 50.83 | 45.00 | 73.33 |
+| R4 (mean K=4 no mask) | 0.100 | 54.17 | 51.04 | 55.00 | 43.96 | 76.67 |
+| **R5** (mean K=8 + soft mask) | 0.10 (~172/300) | 训练中 | — | — | — | — |
+
+eval JSONs in `kl_analysis/phase25/eval/`，汇总脚本 `scripts/extract_eval_summary.py` 和 `scripts/diversity_check.py`。
+
+### 2. 修正：worklog 5/29 "K=8 sweet spot" 是错的
+
+5/29 那次分析用的 SNR 定义是 "K-step KL 跟 instant KL 的相关性"，不是 mean / std。重做 **mean / std SNR(K)** 在 5 个 run 上一致：
+
+| run | SNR(K=1) | SNR(K=4) | SNR(K=8) | SNR(K=16) | SNR(K=32) |
+|---|---:|---:|---:|---:|---:|
+| B | 0.18 | 0.35 | 0.47 | 0.65 | 0.87 |
+| R3b | 0.18 | 0.34 | 0.47 | 0.64 | 0.86 |
+
+**SNR 单调上升 5 倍**，K=32 / K=1 ≈ √32 = 5.66，对应近独立 noise √K 平均。**没 sweet spot**。
+
+K=8 当时报告"sweet spot"实际是 truncation 引起的 plot artifact + 不同 SNR 定义。
+
+### 3. KL dump 上的真实信号 structure（核心 finding）
+
+**Sparsity / 量级**：
+| 量 | 实测 |
+|---|---:|
+| frac(reverse_kl exact 0) | 16-23% |
+| frac(\|reverse_kl\| > 0.05) | 31-34% |
+| spike spacing 中位数 | 2 token |
+| mean(\|reverse_kl\|) | 0.16-0.22（随训练略降）|
+
+**Pearson autocorr 是误导的指标**：
+原始 reverse_kl 的 ρ(d) ≈ 0.03-0.05 看似"独立"，但被 sparse 0 稀释（0-0 配对贡献正协方差但不反映 spike 时间结构）。\|reverse_kl\| autocorr ρ ≈ 0.08，仍然被 0-0 baseline 撑住。
+
+**正确的 spike clustering 指标 = lift**：
+`lift(d) = P(active[t+d]=1 \| active[t]=1) / P(active=1)`
+- lift = 1: 独立
+- lift > 1: spike clustering（reasoning chunk）
+- lift < 1: spike repulsion
+
+实测：
+| run | p_active | lift(1) | lift(2) | lift(4) | lift(8) | lift(16) | lift(32) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| B | 0.342 | **1.45** | 1.33 | 1.24 | 1.17 | 1.15 | 1.13 |
+| R4 | 0.317 | **1.52** | 1.38 | 1.29 | 1.23 | 1.18 | 1.15 |
+| R3b | 0.313 | **1.53** | 1.40 | 1.30 | 1.23 | 1.18 | 1.14 |
+| R5 | 0.317 | **1.53** | 1.39 | 1.29 | 1.23 | 1.20 | 1.15 |
+
+**Spike clustering 真实存在**：active token 在 reasoning chunk 内 cluster，d=1 比 random 高 50%，d=8 仍高 22%，d=32 仍高 14%。
+
+### 4. K-window catch rate（K 的物理意义）
+
+```
+P(K-window contains ≥1 active token, threshold |x| > 0.05):
+K=1   K=2   K=4   K=8   K=16  K=32  K=64
+0.32  0.48  0.65  0.81  0.92  0.97  0.99
+```
+
+K=8 让 81% 的 token 拿到非零 advantage，K=1 只让 32% 拿到。**mean-K 提供了 OPD 训练 signal 的 update density**，instant-K=1 是 sparse update。
+
+R1 的 +3.3pt over instant baseline 来自三个机制叠加：
+- Update density 提升（80% vs 32% token 有非零 advantage）
+- √K noise 平均（K=8 把 amplitude noise 压 2.83x）
+- 利用 spike clustering 的 chunk structure（lift(8) = 1.23）
+
+### 5. 训练阶段（early/mid/late）的 stationarity
+
+| 量 | early | mid | late | 变化 |
+|---|---:|---:|---:|---|
+| frac(active) | 33-38% | 32-35% | 29-31% | 缓慢下降 |
+| mean(\|x\|) | 0.20-0.23 | 0.19-0.22 | 0.16-0.17 | -20% |
+| ρ\|x\|(1) | 0.08 | 0.08 | 0.08 | 不变 |
+| K=8 catch rate | 84% | 83% | 80% | 略降 |
+
+→ reverse_kl 的 temporal structure 是训练 stationary 的（lift / autocorr 不变），变的只是 amplitude（student 整体逼近 teacher）。
+
+### 6. 三个训练健康度 concern 的具体数据
+
+**Concern 1: 前期暴降**
+| run | rollouts 0-9 instant_kl | rollouts 20-29 instant_kl | 暴降倍数 |
+|---|---:|---:|---:|
+| R1 | 0.137 | 0.024 | 5.7× |
+| R3 | 0.136 | ~0.025 | 5.4× |
+| B/R3b/R4 | 0.13 | 0.11-0.13 | <1.2× |
+
+R1/R3 在 30 步内把 instant_kl 推下 5×；其它 run 几乎不动。
+
+**Concern 2: grad_norm spike**
+| run | median grad | spike rollout id | spike grad |
+|---|---:|---:|---:|
+| B | 0.394 | — | 无 spike (0) |
+| R1 | 0.072 | 186, 201 | 11.59 / 4.35 |
+| R3 | 0.071 | 217 | 0.41 |
+| R3b | 0.072 | 213 | 10.15 |
+| R4 | 0.121 | 20 | 11.15 |
+
+每个 cumulative run 都有 1-2 个 ~10x median 的孤立 spike，PPO clip 接住没崩，但每 spike 是一次 stale gradient。
+
+**Concern 3: low instant_kl + high kl_ref**
+R1 末段：instant_kl=0.003, kl_ref=0.092。意思是 **student 在 sampled token 上贴 teacher（mode-seeking）+ 整体分布离 SFT init 远**。这是 reverse-KL OPD 的设计目标（MiniLLM §2.1 mode-seeking），不是 collapse。**diversity 实测 OK**：pass@any-24 = 83% > baseline 76%。
+
+### 7. R3 vs R3b 的 anomaly 仍未解但故事变了
+
+R3 (sum K=8 + mask + kl=0.125) 和 R3b (mean K=8 + mask + kl=1.0) 数学上 interior token 等价（mean = sum/K，coef 抵消 K），boundary 处差 1×→8×。R3 几乎和 R1 一致（57.92 vs 59.17），R3b 垮 8pt（50.83）。
+
+**Hypothesis（更准确版）**：R3b 在 sequence 末尾 K-1=7 个 token 处 advantage magnitude 比 R3 大 K=8 倍 → 末尾 7 token 被过度惩罚 → 训练动态崩塌。R3 因为 sum + 小 kl_coef，末尾 token 反而 advantage **更弱**，避免了 boundary 过度惩罚。
+
+R1 没有 mask flag、走 unpatched code path，advantage 计算最干净，所以最稳定也最强。
+
+**真正未解的是**：R5 (mean K=8 + soft mask) 应该跟 R3b 等价（两者都 mask 不触发），但 R5 训练 trajectory 看起来跟 R3b 接近。等 R5 跑完 eval 验证。
+
+### 8. 文献立场更新（4 篇综合）
+
+| 文献 | 立场 | 跟 R1 +3.3pt 关系 |
+|---|---|---|
+| **MiniLLM** (2306.08543, OPD 起源) | future R_t 有用但需 single-step + length-norm + teacher-mix；naive R_t 会爆 | **不冲突** — R1 = mean K (≈ length-norm 近似)，正好在他们安全区 |
+| **TML blog** (2026) | discount > 0 没看见 improve（脚注，无数据）| weakly conflict |
+| **Revisiting OPD** (2603.25562) | fixed-γ return-to-go variance O(T⁴)，γ=1 toy drift | weakly — 他们用 raw sum 我们用 ÷K |
+| **Rethinking OPD** (2604.13016) | 不讨论 future coupling，关注 thinking pattern + new knowledge + token overlap | **正交** — 我们 setup 满足两个 success condition |
+
+R1 +3.3pt 在文献框架下是 **MiniLLM 的"安全 future" + Rethinking OPD 的"两个 success condition 满足"** 的合理产物，不是发明新 trick。
+
+### 9. R3 / R3b / R5 的 dualclip mask 在我们 setup 是 dormant
+
+KL dump 实测 IS ratio 分布：
+
+| 量 | 值 |
+|---|---:|
+| IS ratio median | 1.000 |
+| IS ratio p99 | 1.12 |
+| IS ratio max | 1.4-1.8 |
+| frac(IS > c=10) | **0.000%** |
+
+slime 是 single-step on-policy GRPO，rollout 和 train 间 weight gap 极小，IS ratio 永远 ≪ 10。FIPO 的 dualclip mask 阈值 c=10 在我们 setup 下数学上**永远不触发**，hard mask / soft mask 在物理上等价 R1（无 mask）。
+
+但 R3b vs R1 实测 trajectory 完全分叉 → mask flag 触发 code path 副作用（rollout_log_probs 被 attach 到 advantage 阶段、autograd graph 多一个 exp 节点等），不是 mask 数学起作用。
+
+### 10. 当前未跑实验（推荐 priority）
+
+1. **R5 跑完 eval iter99/199/299**（自动）
+2. **R1 second seed 复现**（必须 — single seed +3.3pt 不够 paper-grade）
+3. **K=16/32/full sweep**（验证 SNR / lift 单调预测；可能继续涨）
+4. **kl_coef sweep on R1** (1.0 / 0.5 / 0.25)（验证 robustness 不依赖大 kl_coef）
+5. **Single-step decomposition (MiniLLM)**：把 (∇L)_Single 加进 R1 看能否再 +1pt
+6. **Top-K dump format**：补 student/teacher top-20 logp 到 dump，能算 overlap_ratio + entropy_gap（Rethinking OPD 诊断）
+
+### 11. Paper-grade contribution 候选
+
+1. **Reverse-KL token-level temporal structure phenomenology**：lift / autocorr / spacing 的 stationary 结构，文献空白
+2. **K-window catch rate as the right K-selection metric**：物理上替代 SNR 假象，统一 instant / mean-K / sum-K
+3. **R1 winning + diversity-preserved**：4B+8B 上 +3.3pt 同时 pass@any 涨，给 4B+8B teacher 这个 config 的 OPD 上限提供 baseline
+
+### 12. 文件清单
+
+| 文件 | 用途 |
+|---|---|
+| `scripts/extract_eval_summary.py` | 从 eval JSON 拉 avg_pass_at_1 / pass@any / avg_len |
+| `scripts/diversity_check.py` | mode-collapse signature 表（avg ↑ + pany ↓）|
+| `scripts/analyze_phase25_eval_vs_kl.py` | eval ↔ training metric 相关性 |
+| `scripts/analyze_kstep_autocorr.py` | raw autocorr + SNR(K) |
+| `scripts/analyze_kstep_v2.py` | sparsity-aware (\|x\| autocorr + K-window catch) |
+| `scripts/analyze_kstep_lift.py` | lift = P(active\|active) / P(active) — 真正的 spike clustering 指标 |
+| `scripts/analyze_kstep_per_phase.py` | 训练阶段（early/mid/late）分别算 |
+| `scripts/plot_phase25_kl.py` | 6-panel vstack trajectory plot |
+| `kl_analysis/phase25/dump_summary.json` | per-rollout KL dump 数值汇总 |
+| `kl_analysis/phase25/kstep_v2_summary.json` | K-window catch + sparsity |
+| `kl_analysis/phase25/kstep_lift_summary.json` | lift(d) 表 |
+| `kl_analysis/phase25/eval/aime20{24,25}_*.json` | n=16 eval 结果 |
+| `kl_analysis/phase25/phase25_trajectories_vstack.png` | 训练曲线 6-panel 图 |
+| `kl_analysis/phase25/phase25_dump_diagnostic.png` | KL dump 4-panel 诊断 |
+| `kl_analysis/phase25/kstep_window_coverage.png` | K-window catch rate 曲线 |
+| `kl_analysis/phase25/kstep_lift.png` | lift(d) 曲线 |
+| `kl_analysis/phase25/kstep_window_per_phase.png` | per-phase K-window |

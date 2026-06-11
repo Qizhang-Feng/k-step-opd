@@ -1,52 +1,49 @@
 #!/usr/bin/env python3
-"""Plot Phase 2.5 KL comparison: instant KL vs accumulated (mean-K) KL vs kl_loss
-across R1 (mean-K=8), R4 (mean-K=4), and opd-4b-B (instant, K=1).
+"""Plot Phase 2.5 trajectories as a vertical column of panels with shared x.
 
-Metrics (see scripts/extract_kl_csv.py):
-  instant_kl = rollout/opd_reverse_kl  — instant per-token reverse KL (comparable across K)
-  accum_kl   = -rollout/advantages     — aggregated penalty entering advantage
-               (mean-K: divided by K so magnitude ~ instant; instant: == instant_kl)
-  kl_loss    = train/kl_loss           — KL from ref policy (coef=0, logging-only)
-  grad_norm  = train/grad_norm
+Panels (top → bottom):
+    1. instant per-token reverse KL (opd_reverse_kl)
+    2. accumulated KL entering advantage (= -advantage)
+    3. KL from reference policy (train/kl_loss, logging-only)
+    4. grad_norm (own panel, log-y)
+    5. response length (avg per rollout)
+    6. truncation rate
 
-Usage: python3 scripts/plot_phase25_kl.py
+All panels share the same x-axis (rollout id) so events line up across rows.
+
+Run: python3 scripts/plot_phase25_kl.py
 """
 import csv
 import os
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
 HERE = os.path.join("kl_analysis", "phase25")
 RUNS = [
-    ("kl_B.csv", "opd-4b-B (instant, K=1)", "#888888"),
-    ("kl_R4.csv", "R4 (mean-K=4)", "#1f77b4"),
-    ("kl_R1.csv", "R1 (mean-K=8)", "#d62728"),
+    ("kl_B.csv",   "opd-4b-B (instant K=1)",     "#888888"),
+    ("kl_R4.csv",  "R4 (mean K=4, no mask)",     "#2ca02c"),
+    ("kl_R1.csv",  "R1 (mean K=8, no mask)",     "#d62728"),
+    ("kl_R3.csv",  "R3 (sum K=8 + mask)",        "#1f77b4"),
+    ("kl_R3b.csv", "R3b (mean K=8 + mask)",      "#ff7f0e"),
 ]
 
 
 def load(path):
     cols = {}
     with open(path) as f:
-        r = csv.DictReader(f)
-        for row in r:
+        for row in csv.DictReader(f):
             for k, v in row.items():
                 cols.setdefault(k, []).append(float(v) if v not in ("", None) else np.nan)
     return {k: np.array(v) for k, v in cols.items()}
 
 
 def smooth(y, w=11):
-    """Centered moving average with shrinking window at the edges.
-
-    Plain np.convolve(mode="same") zero-pads beyond the array bounds, which
-    drags the first/last few points toward 0 (a fake end-drop). Here each
-    output point averages only the real samples that fall inside the window,
-    so the edges stay faithful to the data.
-    """
+    """Centered moving average that shrinks at the edges (no zero-pad bias)."""
     y = np.asarray(y, dtype=float)
-    # nan-safe: interpolate missing values first
     mask = np.isnan(y)
     if mask.any():
         idx = np.arange(len(y))
@@ -67,83 +64,58 @@ def smooth(y, w=11):
 def main():
     data = {label: load(os.path.join(HERE, fn)) for fn, label, _ in RUNS}
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    panels = [
+        ("instant_kl", "Instant reverse KL  (rollout/opd_reverse_kl)\nlog π_S(a) − log π_T(a)  per token", "linear"),
+        ("accum_kl",   "Accumulated KL entering advantage  (= − rollout/advantages)",                       "linear"),
+        ("kl_loss",    "KL from reference  (train/kl_loss, coef=0, logging-only)",                          "linear"),
+        ("grad_norm",  "Gradient norm  (train/grad_norm)",                                                  "log"),
+        ("resp_len",   "Average response length (tokens / rollout)",                                        "linear"),
+        ("truncated",  "Truncation rate  (frac of samples hitting max_response_len=4096)",                  "linear"),
+    ]
 
-    # Panel 1: instant KL (the comparable-across-K metric)
-    ax = axes[0][0]
-    for fn, label, color in RUNS:
-        d = data[label]
-        ax.plot(d["id"], d["instant_kl"], color=color, alpha=0.25, lw=0.8)
-        ax.plot(d["id"], smooth(d["instant_kl"]), color=color, lw=2, label=label)
-    ax.set_title("Instant per-token reverse KL (opd_reverse_kl)\nlogged identically across K → directly comparable")
-    ax.set_xlabel("rollout id")
-    ax.set_ylabel("instant reverse KL")
-    ax.legend()
-    ax.grid(alpha=0.3)
+    fig, axes = plt.subplots(len(panels), 1, figsize=(11, 2.6 * len(panels)), sharex=True)
+    if len(panels) == 1:
+        axes = [axes]
 
-    # Panel 2: accumulated KL (= -advantage = aggregated penalty)
-    ax = axes[0][1]
-    for fn, label, color in RUNS:
-        d = data[label]
-        ax.plot(d["id"], d["accum_kl"], color=color, alpha=0.25, lw=0.8)
-        ax.plot(d["id"], smooth(d["accum_kl"]), color=color, lw=2, label=label)
-    ax.set_title("Accumulated KL entering advantage (-advantages)\nmean-K divides by K → magnitude stays ~instant")
-    ax.set_xlabel("rollout id")
-    ax.set_ylabel("accumulated (mean-K) KL")
-    ax.legend()
-    ax.grid(alpha=0.3)
+    for ax, (col, title, yscale) in zip(axes, panels):
+        for fn, label, color in RUNS:
+            d = data[label]
+            if col not in d:
+                continue
+            y_raw = d[col]
+            y_smooth = smooth(y_raw)
+            ax.plot(d["id"], y_raw, color=color, alpha=0.18, lw=0.7)
+            ax.plot(d["id"], y_smooth, color=color, lw=1.7, label=label)
+        ax.set_title(title, fontsize=10, loc="left")
+        ax.grid(alpha=0.3)
+        if yscale == "log":
+            ax.set_yscale("log")
+        ax.set_ylabel(col)
 
-    # Panel 3: instant KL on log-y to compare convergence speed
-    ax = axes[1][0]
-    for fn, label, color in RUNS:
-        d = data[label]
-        y = smooth(d["instant_kl"])
-        y = np.clip(y, 1e-4, None)
-        ax.plot(d["id"], y, color=color, lw=2, label=label)
-    ax.set_yscale("log")
-    ax.set_title("Instant KL (log-y) — convergence speed across K")
-    ax.set_xlabel("rollout id")
-    ax.set_ylabel("instant reverse KL (log)")
-    ax.legend()
-    ax.grid(alpha=0.3, which="both")
+    axes[-1].set_xlabel("rollout id")
+    axes[0].legend(loc="upper right", fontsize=9, ncol=2, framealpha=0.95)
 
-    # Panel 4: kl_loss (KL from ref) + grad_norm twin
-    ax = axes[1][1]
-    for fn, label, color in RUNS:
-        d = data[label]
-        ax.plot(d["id"], smooth(d["kl_loss"]), color=color, lw=2, label=f"{label} kl_loss")
-    ax.set_title("KL from ref (train/kl_loss, coef=0 logging-only)\n+ grad_norm (dashed, right axis)")
-    ax.set_xlabel("rollout id")
-    ax.set_ylabel("kl_loss (KL from ref / SFT start)")
-    ax2 = ax.twinx()
-    for fn, label, color in RUNS:
-        d = data[label]
-        ax2.plot(d["id"], smooth(d["grad_norm"]), color=color, lw=1.2, ls="--", alpha=0.7)
-    ax2.set_ylabel("grad_norm (dashed)")
-    ax.legend(loc="upper left", fontsize=8)
-    ax.grid(alpha=0.3)
+    fig.suptitle("Phase 2.5 — training trajectories aligned on rollout id", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.985])
 
-    fig.suptitle("Phase 2.5 — KL trajectories: instant vs accumulated (mean-K) vs kl_loss", fontsize=14)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
-    out = os.path.join(HERE, "phase25_kl_comparison.png")
+    out = os.path.join(HERE, "phase25_trajectories_vstack.png")
     fig.savefig(out, dpi=130)
     print(f"saved {out}")
 
-    # Quick numeric summary
-    print("\n=== Final (last 10 rollouts mean) ===")
-    print(f"{'run':28s} {'instant_kl':>12s} {'accum_kl':>12s} {'kl_loss':>10s} {'grad_norm':>10s}")
-    for fn, label, color in RUNS:
+    # Numeric summary (last 10 rollouts mean)
+    print("\n=== Final (mean of last 10 rollouts) ===")
+    cols = ["instant_kl", "accum_kl", "kl_loss", "grad_norm", "resp_len", "truncated"]
+    header = " ".join(f"{c:>10s}" for c in cols)
+    print(f"{'run':30s} {header}")
+    for fn, label, _color in RUNS:
         d = data[label]
-        def tail(k):
-            v = d[k][-10:]
-            return np.nanmean(v)
-        print(f"{label:28s} {tail('instant_kl'):12.4f} {tail('accum_kl'):12.4f} {tail('kl_loss'):10.4f} {tail('grad_norm'):10.4f}")
-    print("\n=== Start (first 5 rollouts mean) ===")
-    for fn, label, color in RUNS:
-        d = data[label]
-        def head(k):
-            return np.nanmean(d[k][:5])
-        print(f"{label:28s} {head('instant_kl'):12.4f} {head('accum_kl'):12.4f}")
+        vals = []
+        for c in cols:
+            if c in d:
+                vals.append(f"{np.nanmean(d[c][-10:]):>10.4f}")
+            else:
+                vals.append(f"{'—':>10s}")
+        print(f"{label:30s} {' '.join(vals)}")
 
 
 if __name__ == "__main__":

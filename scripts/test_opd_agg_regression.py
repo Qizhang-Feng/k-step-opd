@@ -100,6 +100,20 @@ def main():
     print(f"  t=0 nomask={sum_nomask[0]:.1f} mask={sum_mask[0]:.1f}",
           "PASS" if abs(sum_nomask[0].item() - 10) < 1e-5 and abs(sum_mask[0].item() - 9) < 1e-5 else "*** FAIL ***")
 
+    print("=== Sanity: soft mask preserves signal (weight = c/IS for IS > c) ===")
+    rk2 = torch.ones(10)
+    # Simulate IS ratios: [1,1,1,1,1, 20, 1,1,1,1] — token 5 has IS=20
+    # With c=10: soft_weight[5] = min(10/20, 1) = 0.5, rest = 1.0
+    soft_w = torch.ones(10)
+    soft_w[5] = 0.5  # c/IS = 10/20
+    sum_soft = new_cumulative(rk2, 1.0, -1, "sum", keep_mask=soft_w)
+    # token 0 sum: 9 × 1.0 + 1 × 0.5 = 9.5 (vs hard mask = 9.0, vs no mask = 10.0)
+    expected_soft = 9.5
+    ok_soft = abs(sum_soft[0].item() - expected_soft) < 1e-5
+    print(f"  t=0 soft={sum_soft[0]:.1f} (expected {expected_soft})",
+          "PASS" if ok_soft else "*** FAIL ***")
+    all_ok &= ok_soft
+
     print("DONE", "ALL PASS" if all_ok else "HAS FAILURES")
 
 
