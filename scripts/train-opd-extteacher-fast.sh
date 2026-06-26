@@ -48,6 +48,10 @@ OPD_SOFT_MASK=${OPD_SOFT_MASK:-0}
 OPD_DUMP_KL_PATH=${OPD_DUMP_KL_PATH:-}
 OPD_DUMP_KL_INTERVAL=${OPD_DUMP_KL_INTERVAL:-1}
 OPD_DUMP_KL_MAX_SAMPLES=${OPD_DUMP_KL_MAX_SAMPLES:--1}
+# Form A-K (hybrid OPD with Rao-Blackwellized future)
+OPD_FUTURE_RB=${OPD_FUTURE_RB:-0}
+OPD_FUTURE_TOPK=${OPD_FUTURE_TOPK:-20}
+OPD_FUTURE_NO_RENORM=${OPD_FUTURE_NO_RENORM:-0}
 
 mkdir -p $SAVE_DIR
 
@@ -84,6 +88,15 @@ OPD_DUMP_ARGS=""
 if [ -n "${OPD_DUMP_KL_PATH}" ]; then
     OPD_DUMP_ARGS="--opd-dump-kl-path ${OPD_DUMP_KL_PATH} --opd-dump-kl-interval ${OPD_DUMP_KL_INTERVAL} --opd-dump-kl-max-samples ${OPD_DUMP_KL_MAX_SAMPLES}"
     mkdir -p "$(dirname "${OPD_DUMP_KL_PATH//\{rollout_id\}/0}")" 2>/dev/null || true
+fi
+
+# Build Form A-K (RB future) args
+OPD_FUTURE_RB_ARGS=""
+if [ "${OPD_FUTURE_RB}" = "1" ]; then
+    OPD_FUTURE_RB_ARGS="--opd-future-rb --opd-future-topk $OPD_FUTURE_TOPK"
+    if [ "${OPD_FUTURE_NO_RENORM}" = "1" ]; then
+        OPD_FUTURE_RB_ARGS="$OPD_FUTURE_RB_ARGS --opd-future-no-renorm"
+    fi
 fi
 
 # Build recompute args (only when RECOMPUTE=1)
@@ -144,6 +157,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    --opd-kl-coef $OPD_KL_COEF \
    ${OPD_CUMULATIVE_ARGS} \
    ${OPD_DUMP_ARGS} \
+   ${OPD_FUTURE_RB_ARGS} \
    --use-kl-loss \
    --kl-loss-coef 0.00 \
    --kl-loss-type low_var_kl \
